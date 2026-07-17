@@ -29,49 +29,47 @@ API_AVAILABLE(ios(17.0))
 }
 @end
 
-/// Hook to fix safe area scaling and orientation. We use superview's safeAreaInsets because self one tends to bug out with certain scaling, and also allows us to customize safe area while in PiP mode later on
-API_AVAILABLE(ios(17.0))
-@implementation _UISceneHostingView(LCFixSafeArea)
-- (void)hook__applyOverridesToHostedSceneSettings:(UIMutableApplicationSceneSettings *)settings {
-    [self hook__applyOverridesToHostedSceneSettings:settings];
-    // We don't wanna mess up system extensions
-    if(LCHasRemoteSheetProviderSelector && self._remoteSheetProvider) return;
-    
-    // overwrite safeAreaInsets with our scaled and orientation-fixed version
-    CGAffineTransform transform = self.transform;
-    UIEdgeInsets orig = self.superview.safeAreaInsets;
-    settings.safeAreaInsetsPortrait = UIEdgeInsetsMake(orig.top / transform.d, orig.left / transform.a, orig.bottom / transform.d, orig.right / transform.a);
-}
-
-// fix for 26.x
-- (void)hook_applyViewGeometryToSettings:(UIMutableApplicationSceneSettings *)settings API_AVAILABLE(ios(19.0)) {
-    [self hook_applyViewGeometryToSettings:settings];
-    // We don't wanna mess up system extensions
-    if(LCHasRemoteSheetProviderSelector && self._remoteSheetProvider) return;
-    
-    // same as above, but we have to fix orientation
-    CGAffineTransform transform = self.transform;
-    UIEdgeInsets orig = self.superview.safeAreaInsets;
-    if(UIInterfaceOrientationIsLandscape(settings.interfaceOrientation)) {
-        // apps with glass has an extra top safe area space, so clear it (will it cause inconsistencies?)
-        orig.top = 0;
-    }
-    UIEdgeInsets insets = UIEdgeInsetsMake(orig.top / transform.d, orig.left / transform.a, orig.bottom / transform.d, orig.right / transform.a);
-    settings.safeAreaEdgeInsets = insets;
-    settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(insets, settings.interfaceOrientation);
-}
+@interface FBScene(hooks)
+- (void)hook__performUpdateWithoutActivation:(void (^)(UIMutableApplicationSceneSettings *settings, FBSSceneTransitionContext *context))updateBlock;
 @end
 
-__attribute__((constructor))
+/// Hook to fix safe area scaling and orientation. We use superview's safeAreaInsets because self one tends to bug out with certain scaling, and also allows us to customize safe area while in PiP mode later on.
+/// This hook applies across 18.0-27.0. 17.4+ is uncertain.
+API_AVAILABLE(ios(17.0))
+void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (^updateBlock)(UIMutableApplicationSceneSettings *, FBSSceneTransitionContext *)) {
+    // We don't wanna mess up system extensions on iOS 26+
+    if(LCHasRemoteSheetProviderSelector && self.ui_viewServiceComponent) {
+        [self hook__performUpdateWithoutActivation:updateBlock];
+        return;
+    }
+    
+    _UISceneHostingController *controller = self.delegate;
+    _UISceneHostingView *view = controller.sceneView;
+    id wrappedBlock = ^(UIMutableApplicationSceneSettings *settings, FBSSceneTransitionContext *context) {
+        updateBlock(settings, context);
+        CGAffineTransform transform = view.transform;
+        UIEdgeInsets orig = view.superview.safeAreaInsets;
+        if(LCHasRemoteSheetProviderSelector && UIInterfaceOrientationIsLandscape(settings.interfaceOrientation)) {
+            // apps with glass has an extra top safe area space, so clear it (will it cause inconsistencies?)
+            orig.top = 0;
+        }
+        UIEdgeInsets insets = UIEdgeInsetsMake(orig.top / transform.d, orig.left / transform.a, orig.bottom / transform.d, orig.right / transform.a);
+        if(@available(iOS 19.0, *)) {
+            settings.safeAreaEdgeInsets = insets;
+            // fix orientation
+            settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(insets, settings.interfaceOrientation);
+        } else {
+            settings.safeAreaInsetsPortrait = insets;
+        }
+    };
+    [self hook__performUpdateWithoutActivation:wrappedBlock];
+}
+
 void UIKitFixesInit(void) {
     if (@available(iOS 17.0, *)) {
-        if([_UISceneHostingView.class instancesRespondToSelector:@selector(applyViewGeometryToSettings:)]) {
-            // iOS 26.x selector name
-            swizzle(_UISceneHostingView.class, @selector(applyViewGeometryToSettings:), @selector(hook_applyViewGeometryToSettings:));
-        } else {
-            // iOS 17-18.x selector name
-            swizzle(_UISceneHostingView.class, @selector(_applyOverridesToHostedSceneSettings:), @selector(hook__applyOverridesToHostedSceneSettings:));
-        }
-        LCHasRemoteSheetProviderSelector = [_UISceneHostingView.class instancesRespondToSelector:@selector(_remoteSheetProvider)];
+        Class FBSceneClass = PrivClass(FBScene);
+        LCHasRemoteSheetProviderSelector = [FBSceneClass instancesRespondToSelector:@selector(ui_viewServiceComponent)];
+        class_addMethod(FBSceneClass, @selector(hook__performUpdateWithoutActivation:), (IMP)hook_FBScene_performUpdateWithoutActivation, "v@:@");
+        swizzle(FBSceneClass, @selector(_performUpdateWithoutActivation:), @selector(hook__performUpdateWithoutActivation:));
     }
 }
